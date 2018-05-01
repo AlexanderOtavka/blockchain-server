@@ -7,8 +7,11 @@
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
+#include <sys/stat.h>
 
 #include "picohttpparser/picohttpparser.h"
+
+SSL_CTX* ctx;
 
 int handle_request (SSL* ssl) {
   char buf[4096];
@@ -51,24 +54,55 @@ int handle_request (SSL* ssl) {
            (int)headers[i].value_len, headers[i].value);
   }
 
-  char * response = "HTTP/1.1 404 Not Found\r\n"
-    "Content-Type: text/plain\r\n"
-    "Content-Length: 4\r\n"
-    "\r\n"
-    "not found\r\n"
-    ;
-  SSL_write(ssl, response, strlen(response));
+  char path_string[path_len + 1];
+  strncpy(path_string, path, path_len);
+
+  FILE* file = fopen(path_string, "r");
+  if (file == NULL) {
+    char * response =
+      "HTTP/1.1 404 Not Found\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: 9\r\n"
+      "\r\n"
+      "Not Found\r\n"
+      ;
+
+    SSL_write(ssl, response, strlen(response));
+  } else {
+    fseek(file, 0L, SEEK_END);
+    size_t file_size = ftell(file);
+    rewind(file);
+
+    char response_headers[1000];
+
+    snprintf(
+      response_headers,
+      sizeof(response_headers),
+      "HTTP/1.1 404 Not Found\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: %lu\r\n"
+      "\r\n",
+      file_size
+    );
+
+    SSL_write(ssl, response_headers, strlen(response_headers));
+
+    char file_buffer[0x100];
+    size_t bytes_read;
+    while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
+      SSL_write(ssl, response_headers, bytes_read);
+    }
+  }
+
   return 0;
 }
 
 typedef struct connection_handler_thread_arg {
-  SSL_CTX* ctx;
   int client;
 } connection_handler_thread_arg_t;
 
 void* connection_handler_thread_fn(void* void_arg) {
   connection_handler_thread_arg_t* args = (connection_handler_thread_arg_t*) void_arg;
-  SSL_CTX* ctx = args->ctx;
   int client = args->client;
   free(args);
 
@@ -77,10 +111,8 @@ void* connection_handler_thread_fn(void* void_arg) {
 
   if (SSL_accept(ssl) <= 0) {
     ERR_print_errors_fp(stderr);
-  }
-  else {
+  } else {
     handle_request(ssl);
-
   }
 
   SSL_free(ssl);
@@ -137,7 +169,7 @@ SSL_CTX *create_context()
 
   ctx = SSL_CTX_new(method);
 
-  //SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     
   if (!ctx) {
     perror("Unable to create SSL context");
@@ -148,8 +180,26 @@ SSL_CTX *create_context()
   return ctx;
 }
 
-void configure_context(SSL_CTX *ctx)
+int main(int argc, char **argv)
 {
+  if (argc != 2) {
+    fprintf(stderr, "usage: server <document root>\n");
+    exit(EXIT_FAILURE);
+  }
+
+  char* document_root = argv[1];
+  struct stat stat_buffer;
+  if (stat(document_root, &stat_buffer) != 0) {
+    fprintf(stderr, "Could not open document root\n");
+    exit(EXIT_FAILURE);
+  } else if (!S_ISDIR(stat_buffer.st_mode)) {
+    fprintf(stderr, "Document root is not a directory\n");
+    exit(EXIT_FAILURE);
+  }
+
+  init_openssl();
+  ctx = create_context();
+
   SSL_CTX_set_ecdh_auto(ctx, 1);
 
   /* Set the key and cert */
@@ -162,19 +212,11 @@ void configure_context(SSL_CTX *ctx)
     ERR_print_errors_fp(stderr);
     exit(EXIT_FAILURE);
   }
-}
 
-int main(int argc, char **argv)
-{
-  int sock;
-  SSL_CTX *ctx;
+  // Now that we have read the keys we can change the root
+  chroot(document_root);
 
-  init_openssl();
-  ctx = create_context();
-
-  configure_context(ctx);
-
-  sock = create_socket(4433);
+  int sock = create_socket(4433);
 
   /* Handle connections */
   while(1) {
@@ -188,7 +230,6 @@ int main(int argc, char **argv)
     }
 
     connection_handler_thread_arg_t* args = malloc(sizeof(connection_handler_thread_arg_t));
-    args->ctx = ctx;
     args->client = client;
 
     pthread_t thread;
