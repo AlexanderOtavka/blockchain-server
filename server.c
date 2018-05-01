@@ -6,6 +6,7 @@
 #include <openssl/err.h>
 #include <string.h>
 #include <assert.h>
+#include <pthread.h>
 
 #include "picohttpparser/picohttpparser.h"
 
@@ -58,6 +59,34 @@ int handle_request (SSL* ssl) {
     ;
   SSL_write(ssl, response, strlen(response));
   return 0;
+}
+
+typedef struct connection_handler_thread_arg {
+  SSL_CTX* ctx;
+  int client;
+} connection_handler_thread_arg_t;
+
+void* connection_handler_thread_fn(void* void_arg) {
+  connection_handler_thread_arg_t* args = (connection_handler_thread_arg_t*) void_arg;
+  SSL_CTX* ctx = args->ctx;
+  int client = args->client;
+  free(args);
+
+  SSL* ssl = SSL_new(ctx);
+  SSL_set_fd(ssl, client);
+
+  if (SSL_accept(ssl) <= 0) {
+    ERR_print_errors_fp(stderr);
+  }
+  else {
+    handle_request(ssl);
+
+  }
+
+  SSL_free(ssl);
+  close(client);
+
+  return NULL;
 }
 
 int create_socket(int port)
@@ -151,7 +180,6 @@ int main(int argc, char **argv)
   while(1) {
     struct sockaddr_in addr;
     uint len = sizeof(addr);
-    SSL *ssl;
 
     int client = accept(sock, (struct sockaddr*)&addr, &len);
     if (client < 0) {
@@ -159,20 +187,12 @@ int main(int argc, char **argv)
       exit(EXIT_FAILURE);
     }
 
-    ssl = SSL_new(ctx);
-    SSL_set_fd(ssl, client);
+    connection_handler_thread_arg_t* args = malloc(sizeof(connection_handler_thread_arg_t));
+    args->ctx = ctx;
+    args->client = client;
 
-    if (SSL_accept(ssl) <= 0) {
-      ERR_print_errors_fp(stderr);
-    }
-    else {
-      handle_request(ssl);
-      
-    }
-
-        
-    SSL_free(ssl);
-    close(client);
+    pthread_t thread;
+    pthread_create(&thread, NULL, connection_handler_thread_fn, args);
   }
 
   close(sock);
