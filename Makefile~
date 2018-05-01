@@ -1,8 +1,0 @@
-$CC = clang
-
-$CFLAGS = -g
-
-all: server
-
-server: server.c
-	$(CC) $(CFLAGS) -o server server.c
