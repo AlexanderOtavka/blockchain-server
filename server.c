@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 
 #include "picohttpparser/picohttpparser.h"
 
@@ -61,9 +62,11 @@ int handle_request (SSL* ssl) {
 
   printf("path string: %s\n", path_string);
 
-  FILE* file = fopen(path_string, "r");
-  if (file == NULL) {
-    char * response =
+  struct stat file_stat;
+  bool stat_fail = stat(path_string, &file_stat) != 0;
+
+  if (stat_fail) {
+    char* response =
       "HTTP/1.1 404 Not Found\r\n"
       "Content-Type: text/plain\r\n"
       "Content-Length: 9\r\n"
@@ -72,7 +75,23 @@ int handle_request (SSL* ssl) {
       ;
 
     SSL_write(ssl, response, strlen(response));
+  } else if (file_stat.st_mode & S_IXOTH) {
+    // We are looking at an executable, so run it
   } else {
+    FILE* file = fopen(path_string, "r");
+    if (file == NULL) {
+      char* response =
+        "HTTP/1.1 500 Server Error\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 21\r\n"
+        "\r\n"
+        "Internal Server Error\r\n"
+        ;
+
+      SSL_write(ssl, response, strlen(response));
+      return -1;
+    }
+
     char* file_extension = strrchr(path_string, '.');
     char* mime_type;
     if (file_extension == NULL) {
@@ -89,10 +108,6 @@ int handle_request (SSL* ssl) {
       mime_type = "text/plain";
     }
 
-    fseek(file, 0L, SEEK_END);
-    size_t file_size = ftell(file);
-    rewind(file);
-
     char response_headers[1000];
     snprintf(
       response_headers,
@@ -102,7 +117,7 @@ int handle_request (SSL* ssl) {
       "Content-Length: %lu\r\n"
       "\r\n",
       mime_type,
-      file_size
+      file_stat.st_size
     );
 
     SSL_write(ssl, response_headers, strlen(response_headers));
