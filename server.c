@@ -12,6 +12,7 @@
 #include "picohttpparser/picohttpparser.h"
 
 SSL_CTX* ctx;
+char* document_root;
 
 int handle_request (SSL* ssl) {
   char buf[4096];
@@ -44,18 +45,21 @@ int handle_request (SSL* ssl) {
       return -1;
   }
 
-  printf("request is %d bytes long\n", pret);
-  printf("method is %.*s\n", (int)method_len, method);
-  printf("path is %.*s\n", (int)path_len, path);
-  printf("HTTP version is 1.%d\n", minor_version);
-  printf("headers:\n");
-  for (int i = 0; i != num_headers; ++i) {
-    printf("%.*s: %.*s\n", (int)headers[i].name_len, headers[i].name,
-           (int)headers[i].value_len, headers[i].value);
-  }
+  //printf("request is %d bytes long\n", pret);
+  //printf("method is %.*s\n", (int)method_len, method);
+  //printf("path is %.*s\n", (int)path_len, path);
+  //printf("HTTP version is 1.%d\n", minor_version);
+  //printf("headers:\n");
+  //for (int i = 0; i != num_headers; ++i) {
+  //  printf("%.*s: %.*s\n", (int)headers[i].name_len, headers[i].name,
+  //         (int)headers[i].value_len, headers[i].value);
+  //}
 
-  char path_string[path_len + 1];
-  strncpy(path_string, path, path_len);
+  char path_string[strlen(document_root) + path_len + 1];
+  strcpy(path_string, document_root);
+  strncat(path_string, path, path_len);
+
+  printf("path string: %s\n", path_string);
 
   FILE* file = fopen(path_string, "r");
   if (file == NULL) {
@@ -69,19 +73,35 @@ int handle_request (SSL* ssl) {
 
     SSL_write(ssl, response, strlen(response));
   } else {
+    char* file_extension = strrchr(path_string, '.');
+    char* mime_type;
+    if (file_extension == NULL) {
+      mime_type = "text/plain";
+    } else if (strcmp(file_extension, ".html") == 0) {
+      mime_type = "text/html";
+    } else if (strcmp(file_extension, ".json") == 0) {
+      mime_type = "application/json";
+    } else if (strcmp(file_extension, ".js") == 0) {
+      mime_type = "application/javascript";
+    } else if (strcmp(file_extension, ".css") == 0) {
+      mime_type = "text/css";
+    } else {
+      mime_type = "text/plain";
+    }
+
     fseek(file, 0L, SEEK_END);
     size_t file_size = ftell(file);
     rewind(file);
 
     char response_headers[1000];
-
     snprintf(
       response_headers,
       sizeof(response_headers),
-      "HTTP/1.1 404 Not Found\r\n"
-      "Content-Type: text/plain\r\n"
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: %s\r\n"
       "Content-Length: %lu\r\n"
       "\r\n",
+      mime_type,
       file_size
     );
 
@@ -90,7 +110,7 @@ int handle_request (SSL* ssl) {
     char file_buffer[0x100];
     size_t bytes_read;
     while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
-      SSL_write(ssl, response_headers, bytes_read);
+      SSL_write(ssl, file_buffer, bytes_read);
     }
   }
 
@@ -187,7 +207,11 @@ int main(int argc, char **argv)
     exit(EXIT_FAILURE);
   }
 
-  char* document_root = argv[1];
+  document_root = strdup(argv[1]);
+  if (document_root[strlen(document_root) - 1] == '/') {
+    document_root[strlen(document_root) - 1] = '\0';
+  }
+
   struct stat stat_buffer;
   if (stat(document_root, &stat_buffer) != 0) {
     fprintf(stderr, "Could not open document root\n");
@@ -212,9 +236,6 @@ int main(int argc, char **argv)
     ERR_print_errors_fp(stderr);
     exit(EXIT_FAILURE);
   }
-
-  // Now that we have read the keys we can change the root
-  chroot(document_root);
 
   int sock = create_socket(4433);
 
