@@ -9,6 +9,8 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <stdbool.h>
+#include <sys/wait.h>
+
 
 #include "picohttpparser/picohttpparser.h"
 
@@ -27,8 +29,10 @@ int handle_request (SSL* ssl) {
     /* read the request */
     while ((rret = SSL_read(ssl, buf + buflen, sizeof(buf) - buflen)) == -1
            && errno == EINTR);
-    if (rret <= 0)
+    if (rret <= 0) {
+      fprintf(stderr, "failed to read\n");
       return -1;
+    }
     prevbuflen = buflen;
     buflen += rret;
     /* parse the request */
@@ -38,12 +42,16 @@ int handle_request (SSL* ssl) {
                              prevbuflen);
     if (pret > 0)
       break; /* successfully parsed the request */
-    else if (pret == -1)
+    else if (pret == -1) {
+      fprintf(stderr, "failed to parse\n");
       return -1;
+    }
     /* request is incomplete, continue the loop */
     assert(pret == -2);
-    if (buflen == sizeof(buf))
+    if (buflen == sizeof(buf)) {
+      fprintf(stderr, "request too large\n");
       return -1;
+    }
   }
 
   //printf("request is %d bytes long\n", pret);
@@ -77,18 +85,75 @@ int handle_request (SSL* ssl) {
     SSL_write(ssl, response, strlen(response));
   } else if (file_stat.st_mode & S_IXOTH) {
     // We are looking at an executable, so run it
+    int pipes[2][2];
+    pipe(pipes[0]);
+    pipe(pipes[1]);
+    int child_read_fd = pipes[0][0];
+    int child_write_fd = pipes[1][1];
+    
+    int parent_read_fd = pipes[1][0];
+    int parent_write_fd = pipes[0][1];
+
+    // read the request into child read
+    write(parent_write_fd, buf, sizeof(char)*buflen);
+    
+    int pid = fork();
+    if (pid == 0) {
+      
+      dup2(child_read_fd, STDIN_FILENO);
+      dup2(child_write_fd, STDOUT_FILENO);
+
+      close(child_read_fd);
+      close(child_write_fd);
+      close(parent_read_fd);
+      close(parent_write_fd);
+      char * args[] = {path_string, NULL};
+
+      if (execvp(args[0], args) == -1) {
+        fprintf(stderr, "Invalid executable.\n");
+        return -1;
+      }
+    } else {
+      close(child_read_fd);
+      close(child_write_fd);
+      // Send executable's output to the client
+      char write_buf[256];
+      while (read(parent_read_fd, write_buf, sizeof(write_buf)-1)) {
+        SSL_write(ssl, write_buf, strlen(write_buf));
+      }
+      waitpid(pid, NULL, 0);
+    }
+    /*
+    char buf[256];
+    buf[255] = '\0';
+    FILE * output = popen(path_string, "r");
+    fseek(output, 0L, SEEK_END);
+    int size = ftell(output);
+    rewind(output);
+    char response[1000];
+    snprintf(
+             response,
+             sizeof(response),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %d\r\n"
+             "\r\n",
+             size
+             );
+    SSL_write(ssl, response, strlen(response));
+    if (output != NULL) {
+      while (fread(buf, sizeof(char), 255, output) > 0) {
+        SSL_write(ssl, buf, strlen(buf));
+      }
+    } else {
+      return -1;
+    }
+    pclose(output);   
+    */      
   } else {
     FILE* file = fopen(path_string, "r");
     if (file == NULL) {
-      char* response =
-        "HTTP/1.1 500 Server Error\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 21\r\n"
-        "\r\n"
-        "Internal Server Error\r\n"
-        ;
-
-      SSL_write(ssl, response, strlen(response));
+      fprintf(stderr, "Server error\n");
       return -1;
     }
 
@@ -147,7 +212,18 @@ void* connection_handler_thread_fn(void* void_arg) {
   if (SSL_accept(ssl) <= 0) {
     ERR_print_errors_fp(stderr);
   } else {
-    handle_request(ssl);
+    int handle_ret = handle_request(ssl);
+    if (handle_ret == -1) {
+      char* response =
+        "HTTP/1.1 500 Server Error\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 21\r\n"
+        "\r\n"
+        "Internal Server Error\r\n"
+        ;
+
+      SSL_write(ssl, response, strlen(response));
+    }
   }
 
   SSL_free(ssl);
