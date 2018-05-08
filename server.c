@@ -1,21 +1,106 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
-#include <sys/stat.h>
 #include <stdbool.h>
-#include <sys/wait.h>
-
+#include <time.h>
+#include <limits.h>
 
 #include "picohttpparser/picohttpparser.h"
 
 SSL_CTX* ctx;
 char* document_root;
+
+typedef struct cache_node {
+  pthread_mutex_t mutex;
+  char* path;
+  char* contents;
+  time_t time_added;
+  struct cache_node* next;
+} cache_node_t;
+
+#define MAX_CACHE_SIZE 2
+size_t cache_size;
+cache_node_t* cache[MAX_CACHE_SIZE] = {0};
+pthread_mutex_t cache_bucket_mutexes[MAX_CACHE_SIZE];
+
+unsigned int hash_randomizer;
+
+unsigned int power_mod(unsigned int base, unsigned int expt) {
+  // Make it a long to prevent overflow
+  unsigned long power = 1;
+  for (unsigned int i = 0; i < expt; i++) {
+    power = (power * base) % UINT_MAX;
+  }
+
+  return power;
+}
+
+#define BIG_PRIME 7349
+
+// pre: hash_randomizer is initialized to a random value
+unsigned int hash(char* string) {
+  // Make it a long to prevent overflow
+  unsigned long sum = 0;
+  size_t string_len = strlen(string);
+  for (size_t i = 0; i < string_len; i++) {
+    sum += string[i] * power_mod(BIG_PRIME, i);
+    sum %= UINT_MAX;
+  }
+
+  return sum ^ hash_randomizer;
+}
+
+// cache_add takes ownership of path and contents, which should be created with
+// malloc
+void cache_add(char* path, char* contents) {
+  if (cache_size >= MAX_CACHE_SIZE) {
+    // TODO: Kick a random thing
+  }
+
+  cache_node_t* new = malloc(sizeof(cache_node_t));
+  pthread_mutex_init(&new->mutex, NULL);
+  new->path = path;
+  new->contents = contents;
+  new->time_added = time(NULL);
+
+  unsigned int index = hash(path) % MAX_CACHE_SIZE;
+  pthread_mutex_lock(&cache_bucket_mutexes[index]);
+
+  new->next = cache[index];
+  cache[index] = new;
+
+  pthread_mutex_unlock(&cache_bucket_mutexes[index]);
+}
+
+// cache_get returns a locked node that should be unlocked with cache_unlock when done
+cache_node_t* cache_get(char* path) {
+  unsigned int index = hash(path) % MAX_CACHE_SIZE;
+  pthread_mutex_lock(&cache_bucket_mutexes[index]);
+
+  cache_node_t* curr;
+  for (curr = cache[index]; curr != NULL; curr = curr->next) {
+    if (strcmp(curr->path, path) == 0) {
+      pthread_mutex_lock(&curr->mutex);
+      break;
+    }
+  }
+
+  pthread_mutex_unlock(&cache_bucket_mutexes[index]);
+
+  return curr;
+}
+
+void cache_unlock(cache_node_t* node) {
+  pthread_mutex_unlock(&node->mutex);
+}
 
 int handle_request (SSL* ssl) {
   char buf[4096];
@@ -99,7 +184,6 @@ int handle_request (SSL* ssl) {
     
     int pid = fork();
     if (pid == 0) {
-      
       dup2(child_read_fd, STDIN_FILENO);
       dup2(child_write_fd, STDOUT_FILENO);
 
@@ -123,33 +207,6 @@ int handle_request (SSL* ssl) {
       }
       waitpid(pid, NULL, 0);
     }
-    /*
-    char buf[256];
-    buf[255] = '\0';
-    FILE * output = popen(path_string, "r");
-    fseek(output, 0L, SEEK_END);
-    int size = ftell(output);
-    rewind(output);
-    char response[1000];
-    snprintf(
-             response,
-             sizeof(response),
-             "HTTP/1.1 200 OK\r\n"
-             "Content-Type: text/plain\r\n"
-             "Content-Length: %d\r\n"
-             "\r\n",
-             size
-             );
-    SSL_write(ssl, response, strlen(response));
-    if (output != NULL) {
-      while (fread(buf, sizeof(char), 255, output) > 0) {
-        SSL_write(ssl, buf, strlen(buf));
-      }
-    } else {
-      return -1;
-    }
-    pclose(output);   
-    */      
   } else {
     FILE* file = fopen(path_string, "r");
     if (file == NULL) {
@@ -296,6 +353,13 @@ int main(int argc, char **argv)
   if (argc != 2) {
     fprintf(stderr, "usage: server <document root>\n");
     exit(EXIT_FAILURE);
+  }
+
+  srand(time(NULL));
+  hash_randomizer = rand() % UINT_MAX;
+
+  for (int i = 0; i < MAX_CACHE_SIZE; i++) {
+    pthread_mutex_init(&cache_bucket_mutexes[i], NULL);
   }
 
   document_root = strdup(argv[1]);
