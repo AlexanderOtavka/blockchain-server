@@ -22,11 +22,13 @@ typedef struct cache_node {
   pthread_mutex_t mutex;
   char* path;
   char* contents;
+  size_t size;
   time_t time_added;
   struct cache_node* next;
 } cache_node_t;
 
 #define MAX_CACHE_SIZE 2
+pthread_mutex_t cache_size_mutex = PTHREAD_MUTEX_INITIALIZER;
 size_t cache_size;
 cache_node_t* cache[MAX_CACHE_SIZE] = {0};
 pthread_mutex_t cache_bucket_mutexes[MAX_CACHE_SIZE];
@@ -60,16 +62,39 @@ unsigned int hash(char* string) {
 
 // cache_add takes ownership of path and contents, which should be created with
 // malloc
-void cache_add(char* path, char* contents) {
-  if (cache_size >= MAX_CACHE_SIZE) {
-    // TODO: Kick a random thing
-  }
-
+void cache_add(char* path, char* contents, size_t size) {
   cache_node_t* new = malloc(sizeof(cache_node_t));
   pthread_mutex_init(&new->mutex, NULL);
   new->path = path;
   new->contents = contents;
+  new->size = size;
   new->time_added = time(NULL);
+  
+  pthread_mutex_lock(&cache_size_mutex);
+  cache_size++;
+  
+  if (cache_size > MAX_CACHE_SIZE) {
+    printf("Kicking something from the cache\n");
+    int rand_index = rand() % MAX_CACHE_SIZE;
+    pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
+    cache_node_t* node_to_kick = cache[rand_index];
+    while (node_to_kick == NULL) {
+      pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
+      rand_index++;
+      rand_index %= MAX_CACHE_SIZE;
+      pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
+      node_to_kick = cache[rand_index];
+    }
+    pthread_mutex_lock(&node_to_kick->mutex);
+    cache[rand_index] = node_to_kick->next;
+    pthread_mutex_unlock(&node_to_kick->mutex);
+    pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
+    free(node_to_kick->path);
+    free(node_to_kick->contents);
+    free(node_to_kick);
+    cache_size--;
+  }
+  pthread_mutex_unlock(&cache_size_mutex);
 
   unsigned int index = hash(path) % MAX_CACHE_SIZE;
   pthread_mutex_lock(&cache_bucket_mutexes[index]);
@@ -99,7 +124,9 @@ cache_node_t* cache_get(char* path) {
 }
 
 void cache_unlock(cache_node_t* node) {
-  pthread_mutex_unlock(&node->mutex);
+  if (node != NULL) {
+    pthread_mutex_unlock(&node->mutex);
+  }
 }
 
 int handle_request (SSL* ssl) {
@@ -139,24 +166,26 @@ int handle_request (SSL* ssl) {
     }
   }
 
-  //printf("request is %d bytes long\n", pret);
-  //printf("method is %.*s\n", (int)method_len, method);
-  //printf("path is %.*s\n", (int)path_len, path);
-  //printf("HTTP version is 1.%d\n", minor_version);
-  //printf("headers:\n");
-  //for (int i = 0; i != num_headers; ++i) {
-  //  printf("%.*s: %.*s\n", (int)headers[i].name_len, headers[i].name,
-  //         (int)headers[i].value_len, headers[i].value);
-  //}
-
-  char path_string[strlen(document_root) + path_len + 1];
+  char* path_string = malloc(strlen(document_root) + path_len + 1);
   strcpy(path_string, document_root);
   strncat(path_string, path, path_len);
 
   printf("path string: %s\n", path_string);
-
-  struct stat file_stat;
-  bool stat_fail = stat(path_string, &file_stat) != 0;
+  cache_node_t* cached_file = cache_get(path_string);
+  bool stat_fail = false;
+  bool is_executable = false;
+  size_t size;
+  
+  if (cached_file == NULL) {
+    struct stat file_stat;
+    stat_fail = stat(path_string, &file_stat) != 0;
+    
+    is_executable = file_stat.st_mode & S_IXOTH;
+    size = file_stat.st_size;
+  } else {
+    printf("Cache contained %s\n", path_string);
+    size = cached_file->size;
+  }
 
   if (stat_fail) {
     char* response =
@@ -168,7 +197,7 @@ int handle_request (SSL* ssl) {
       ;
 
     SSL_write(ssl, response, strlen(response));
-  } else if (file_stat.st_mode & S_IXOTH) {
+  } else if (is_executable) {
     // We are looking at an executable, so run it
     int pipes[2][2];
     pipe(pipes[0]);
@@ -195,6 +224,7 @@ int handle_request (SSL* ssl) {
 
       if (execvp(args[0], args) == -1) {
         fprintf(stderr, "Invalid executable.\n");
+        cache_unlock(cached_file);
         return -1;
       }
     } else {
@@ -211,6 +241,7 @@ int handle_request (SSL* ssl) {
     FILE* file = fopen(path_string, "r");
     if (file == NULL) {
       fprintf(stderr, "Server error\n");
+      cache_unlock(cached_file);
       return -1;
     }
 
@@ -239,18 +270,28 @@ int handle_request (SSL* ssl) {
       "Content-Length: %lu\r\n"
       "\r\n",
       mime_type,
-      file_stat.st_size
+      size
     );
 
     SSL_write(ssl, response_headers, strlen(response_headers));
 
-    char file_buffer[0x100];
-    size_t bytes_read;
-    while ((bytes_read = fread(file_buffer, 1, sizeof(file_buffer), file)) > 0) {
-      SSL_write(ssl, file_buffer, bytes_read);
+    if (cached_file == NULL) {
+      char* file_buffer = malloc(size);
+      if (fread(file_buffer, 1, size, file) != size) {
+        perror("fread error.\n");
+        cache_unlock(cached_file);
+        return -1;
+      }
+      SSL_write(ssl, file_buffer, size);
+      if (cached_file == NULL) {
+        printf("Adding %s to the cache.\n", path_string);
+        cache_add(path_string, file_buffer, size);
+      }
+    } else {
+      SSL_write(ssl, cached_file->contents, cached_file->size);
     }
   }
-
+  cache_unlock(cached_file);
   return 0;
 }
 
