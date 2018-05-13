@@ -1,6 +1,6 @@
 CC = clang
 
-CFLAGS = -g
+CFLAGS += -g
 LIBS = `pkg-config --libs openssl` -lpthread
 
 all: build/server

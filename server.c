@@ -14,6 +14,13 @@
 #include <limits.h>
 
 #include "picohttpparser/picohttpparser.h"
+#define CACHE_POLICY_NO_CACHE 0
+#define CACHE_POLICY_RANDOM 1
+#define CACHE_POLICY_NRU 2
+
+#ifndef CACHE_POLICY
+#define CACHE_POLICY CACHE_POLICY_RANDOM
+#endif
 
 SSL_CTX* ctx;
 char* document_root;
@@ -24,6 +31,7 @@ typedef struct cache_node {
   char* contents;
   size_t size;
   time_t time_added;
+  bool used;
   struct cache_node* next;
 } cache_node_t;
 
@@ -32,6 +40,10 @@ pthread_mutex_t cache_size_mutex = PTHREAD_MUTEX_INITIALIZER;
 size_t cache_size;
 cache_node_t* cache[MAX_CACHE_SIZE] = {0};
 pthread_mutex_t cache_bucket_mutexes[MAX_CACHE_SIZE];
+
+int nru_current_bucket = 0;
+cache_node_t* nru_current_node = NULL;
+cache_node_t* nru_prev_node = NULL;
 
 unsigned int hash_randomizer;
 
@@ -60,6 +72,68 @@ unsigned int hash(char* string) {
   return sum ^ hash_randomizer;
 }
 
+void kick_node (cache_node_t* node_to_kick, cache_node_t* prev, int bucket_index) {
+  printf("Kicking: %s\n", node_to_kick->path);
+  if (node_to_kick == nru_current_node) {
+    nru_current_node = nru_current_node->next;
+  } else if (node_to_kick == nru_prev_node) {
+    nru_prev_node = prev;
+  }
+  pthread_mutex_lock(&node_to_kick->mutex);
+  if (prev == NULL) {
+    cache[bucket_index] = node_to_kick->next;
+  } else {
+    prev->next = node_to_kick->next;
+  }
+  pthread_mutex_unlock(&node_to_kick->mutex);
+  free(node_to_kick->path);
+  free(node_to_kick->contents);
+  free(node_to_kick);
+}
+
+void cache_kick_random (void) {
+  int rand_index = rand() % MAX_CACHE_SIZE;
+  pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
+  cache_node_t* node_to_kick = cache[rand_index];
+  while (node_to_kick == NULL) {
+    pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
+    rand_index++;
+    rand_index %= MAX_CACHE_SIZE;
+    pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
+    node_to_kick = cache[rand_index];
+  }
+  kick_node(node_to_kick, NULL, rand_index);
+  pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
+  cache_size--;
+}
+
+void cache_kick_nru (void) {  
+  pthread_mutex_lock(&cache_bucket_mutexes[nru_current_bucket]);
+  cache_node_t* current = nru_current_node;
+  cache_node_t* prev = nru_prev_node;
+  while (true) {
+    while (current == NULL) {
+      pthread_mutex_unlock(&cache_bucket_mutexes[nru_current_bucket]);
+      nru_current_bucket = (nru_current_bucket+1)%MAX_CACHE_SIZE;
+      pthread_mutex_lock(&cache_bucket_mutexes[nru_current_bucket]);
+      current = cache[nru_current_bucket];
+      prev = NULL;
+    }
+    while (current != NULL) {
+      if (current->used == true) {
+        current->used = false;
+      } else {
+        // remove the item
+        kick_node(current, prev, nru_current_bucket);
+        pthread_mutex_unlock(&cache_bucket_mutexes[nru_current_bucket]);
+        nru_current_bucket++;
+        return;
+      }
+      current = current->next;
+    }
+  }
+}
+
 // cache_add takes ownership of path and contents, which should be created with
 // malloc
 void cache_add(char* path, char* contents, size_t size) {
@@ -68,31 +142,18 @@ void cache_add(char* path, char* contents, size_t size) {
   new->path = path;
   new->contents = contents;
   new->size = size;
+  new->used = true;
   new->time_added = time(NULL);
   
   pthread_mutex_lock(&cache_size_mutex);
   cache_size++;
   
   if (cache_size > MAX_CACHE_SIZE) {
-    printf("Kicking something from the cache\n");
-    int rand_index = rand() % MAX_CACHE_SIZE;
-    pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
-    cache_node_t* node_to_kick = cache[rand_index];
-    while (node_to_kick == NULL) {
-      pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
-      rand_index++;
-      rand_index %= MAX_CACHE_SIZE;
-      pthread_mutex_lock(&cache_bucket_mutexes[rand_index]);
-      node_to_kick = cache[rand_index];
+    if (CACHE_POLICY == CACHE_POLICY_RANDOM) {
+      cache_kick_random();
+    } else {
+      cache_kick_nru();
     }
-    pthread_mutex_lock(&node_to_kick->mutex);
-    cache[rand_index] = node_to_kick->next;
-    pthread_mutex_unlock(&node_to_kick->mutex);
-    pthread_mutex_unlock(&cache_bucket_mutexes[rand_index]);
-    free(node_to_kick->path);
-    free(node_to_kick->contents);
-    free(node_to_kick);
-    cache_size--;
   }
   pthread_mutex_unlock(&cache_size_mutex);
 
@@ -111,13 +172,24 @@ cache_node_t* cache_get(char* path) {
   pthread_mutex_lock(&cache_bucket_mutexes[index]);
 
   cache_node_t* curr;
+  cache_node_t* prev = NULL;
   for (curr = cache[index]; curr != NULL; curr = curr->next) {
     if (strcmp(curr->path, path) == 0) {
-      pthread_mutex_lock(&curr->mutex);
+      // Check if this item in the cache is stale, if so, remove it
+      int MAX_AGE_SEC = 60*30;
+      if ((time(NULL) - curr->time_added)>MAX_AGE_SEC) {
+        kick_node (curr, prev, index);
+        curr = NULL;
+      } else {
+        pthread_mutex_lock(&curr->mutex);
+        curr->used = true;
+      }
       break;
+ 
     }
+    prev = curr;
   }
-
+  
   pthread_mutex_unlock(&cache_bucket_mutexes[index]);
 
   return curr;
@@ -171,10 +243,13 @@ int handle_request (SSL* ssl) {
   strncat(path_string, path, path_len);
 
   printf("path string: %s\n", path_string);
-  cache_node_t* cached_file = cache_get(path_string);
+  cache_node_t* cached_file = NULL;
   bool stat_fail = false;
   bool is_executable = false;
   size_t size;
+  if (CACHE_POLICY != CACHE_POLICY_NO_CACHE) {
+    cached_file = cache_get(path_string);
+  }
   
   if (cached_file == NULL) {
     struct stat file_stat;
@@ -271,7 +346,7 @@ int handle_request (SSL* ssl) {
       "\r\n",
       mime_type,
       size
-    );
+             );
 
     SSL_write(ssl, response_headers, strlen(response_headers));
 
@@ -283,7 +358,7 @@ int handle_request (SSL* ssl) {
         return -1;
       }
       SSL_write(ssl, file_buffer, size);
-      if (cached_file == NULL) {
+      if (CACHE_POLICY != CACHE_POLICY_NO_CACHE) {
         printf("Adding %s to the cache.\n", path_string);
         cache_add(path_string, file_buffer, size);
       }
@@ -403,6 +478,18 @@ int main(int argc, char **argv)
     pthread_mutex_init(&cache_bucket_mutexes[i], NULL);
   }
 
+  switch (CACHE_POLICY) {
+  case CACHE_POLICY_NO_CACHE:
+    printf("Cache disabled.\n");
+    break;
+  case CACHE_POLICY_NRU:
+    printf("NRU cache enabled.\n");
+    break;
+  case CACHE_POLICY_RANDOM:
+    printf("Random cache enabled.\n");
+    break;
+  }
+  
   document_root = strdup(argv[1]);
   if (document_root[strlen(document_root) - 1] == '/') {
     document_root[strlen(document_root) - 1] = '\0';
