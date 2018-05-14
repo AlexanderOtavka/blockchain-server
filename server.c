@@ -18,6 +18,10 @@
 #define CACHE_POLICY_RANDOM 1
 #define CACHE_POLICY_NRU 2
 
+#ifndef PORT
+#define PORT 4433
+#endif
+
 #ifndef CACHE_POLICY
 #define CACHE_POLICY CACHE_POLICY_RANDOM
 #endif
@@ -42,6 +46,7 @@ cache_node_t* cache[MAX_CACHE_SIZE] = {0};
 pthread_rwlock_t cache_bucket_mutexes[MAX_CACHE_SIZE];
 
 int nru_current_bucket = 0;
+pthread_mutex_t nru_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 cache_node_t* nru_current_node = NULL;
 cache_node_t* nru_prev_node = NULL;
 
@@ -74,10 +79,12 @@ unsigned int hash(char* string) {
 
 void kick_node (cache_node_t* node_to_kick, cache_node_t* prev, int bucket_index) {
   printf("Kicking: %s\n", node_to_kick->path);
-  if (node_to_kick == nru_current_node) {
-    nru_current_node = nru_current_node->next;
-  } else if (node_to_kick == nru_prev_node) {
-    nru_prev_node = prev;
+  if (CACHE_POLICY == CACHE_POLICY_NRU) {
+    if (node_to_kick == nru_current_node) {
+      nru_current_node = nru_current_node->next;
+    } else if (node_to_kick == nru_prev_node) {
+      nru_prev_node = prev;
+    }
   }
   pthread_rwlock_wrlock(&node_to_kick->mutex);
   if (prev == NULL) {
@@ -107,7 +114,8 @@ void cache_kick_random (void) {
   cache_size--;
 }
 
-void cache_kick_nru (void) {  
+void cache_kick_nru (void) {
+  pthread_mutex_lock(&nru_state_mutex);
   pthread_rwlock_wrlock(&cache_bucket_mutexes[nru_current_bucket]);
   cache_node_t* current = nru_current_node;
   cache_node_t* prev = nru_prev_node;
@@ -120,15 +128,18 @@ void cache_kick_nru (void) {
       prev = NULL;
     }
     while (current != NULL) {
+      pthread_rwlock_wrlock(&current->mutex);
       if (current->used == true) {
         current->used = false;
       } else {
         // remove the item
+        pthread_rwlock_unlock(&current->mutex);
         kick_node(current, prev, nru_current_bucket);
         pthread_rwlock_unlock(&cache_bucket_mutexes[nru_current_bucket]);
-        nru_current_bucket++;
+        pthread_mutex_unlock(&nru_state_mutex);
         return;
       }
+      pthread_rwlock_unlock(&current->mutex);
       current = current->next;
     }
   }
@@ -164,6 +175,9 @@ void cache_add(char* path, char* contents, size_t size) {
   while (current != NULL) {
     if (strcmp(current->path, path) == 0) {
       pthread_rwlock_unlock(&cache_bucket_mutexes[index]);
+      pthread_mutex_lock(&cache_size_mutex);
+      cache_size--;
+      pthread_mutex_unlock(&cache_size_mutex);
       free(new->path);
       free(new->contents);
       free(new);
@@ -173,7 +187,6 @@ void cache_add(char* path, char* contents, size_t size) {
   
   new->next = cache[index];
   cache[index] = new;
-
   pthread_rwlock_unlock(&cache_bucket_mutexes[index]);
 }
 
@@ -190,7 +203,9 @@ cache_node_t* cache_get(char* path) {
       int MAX_AGE_SEC = 60*30;
       if ((time(NULL) - curr->time_added)>MAX_AGE_SEC) {
         printf("Cache has gone stale\n");
+        pthread_mutex_lock(&nru_state_mutex);
         kick_node (curr, prev, index);
+        pthread_mutex_unlock(&nru_state_mutex);
         curr = NULL;
       } else {
         pthread_rwlock_rdlock(&curr->mutex);
@@ -390,7 +405,7 @@ void* connection_handler_thread_fn(void* void_arg) {
   connection_handler_thread_arg_t* args = (connection_handler_thread_arg_t*) void_arg;
   int client = args->client;
   free(args);
-
+  
   SSL* ssl = SSL_new(ctx);
   SSL_set_fd(ssl, client);
 
@@ -532,13 +547,14 @@ int main(int argc, char **argv)
     exit(EXIT_FAILURE);
   }
 
-  int sock = create_socket(4433);
+  int sock = create_socket(PORT);
 
   /* Handle connections */
   while(1) {
     struct sockaddr_in addr;
     uint len = sizeof(addr);
 
+    
     int client = accept(sock, (struct sockaddr*)&addr, &len);
     if (client < 0) {
       perror("Unable to accept");
