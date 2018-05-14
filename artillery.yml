@@ -5,8 +5,8 @@ config:
         tls:
             rejectUnauthorized: false
     phases:
-        - arrivalRate: 20
-          duration: 10
+        - arrivalRate: 10
+          duration: 5
     payload:
         path: "paths.csv"
         fields:
