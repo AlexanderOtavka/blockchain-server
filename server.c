@@ -315,7 +315,7 @@ int handle_request (SSL* ssl) {
   } else {
     FILE* file = fopen(path_string, "r");
     if (file == NULL) {
-      fprintf(stderr, "Server error\n");
+      fprintf(stderr, "Couldn't open file\n");
       cache_unlock(cached_file);
       return -1;
     }
