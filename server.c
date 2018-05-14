@@ -160,6 +160,17 @@ void cache_add(char* path, char* contents, size_t size) {
   unsigned int index = hash(path) % MAX_CACHE_SIZE;
   pthread_rwlock_wrlock(&cache_bucket_mutexes[index]);
 
+  cache_node_t* current = cache[index];
+  while (current != NULL) {
+    if (strcmp(current->path, path) == 0) {
+      pthread_rwlock_unlock(&cache_bucket_mutexes[index]);
+      free(new->path);
+      free(new->contents);
+      free(new);
+      return;
+    }
+  }
+  
   new->next = cache[index];
   cache[index] = new;
 
