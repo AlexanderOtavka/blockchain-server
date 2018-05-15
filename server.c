@@ -198,7 +198,7 @@ void cache_add(char* path, char* contents, size_t size) {
   // bucket
   unsigned int index = hash(path) % MAX_CACHE_SIZE;
   pthread_rwlock_wrlock(&cache_bucket_mutexes[index]);
-
+  
   cache_node_t* current = cache[index];
   while (current != NULL) {
     if (strcmp(current->path, path) == 0) {
@@ -211,7 +211,9 @@ void cache_add(char* path, char* contents, size_t size) {
       free(new);
       return;
     }
+    current = current->next;
   }
+
   // if the node isn't already present, add it 
   new->next = cache[index];
   cache[index] = new;
@@ -227,8 +229,10 @@ cache_node_t* cache_get(char* path) {
 
   cache_node_t* curr;
   cache_node_t* prev = NULL;
-  for (curr = cache[index]; curr != NULL; curr = curr->next) {
+  int buckets_checked = 0;
+  for (curr = cache[index]; curr != NULL && buckets_checked < MAX_CACHE_SIZE; curr = curr->next) {
     if (strcmp(curr->path, path) == 0) {
+      printf("found in cache\n");
       // Check if this item in the cache is stale, if so, remove it
       int MAX_AGE_SEC = 60*30;
       if ((time(NULL) - curr->time_added)>MAX_AGE_SEC) {
@@ -242,15 +246,16 @@ cache_node_t* cache_get(char* path) {
         curr->used = true;
       }
       break;
- 
     }
     prev = curr;
+    buckets_checked++;
   }
   
   pthread_rwlock_unlock(&cache_bucket_mutexes[index]);
 
   return curr;
 }
+
 
 // unlock a cache node after we're done returning it to the user
 void cache_unlock(cache_node_t* node) {
@@ -546,7 +551,7 @@ int main(int argc, char **argv)
   hash_randomizer = rand() % UINT_MAX;
 
   for (int i = 0; i < MAX_CACHE_SIZE; i++) {
-    pthread_rwlock_init(&cache_bucket_mutexes[i], NULL);
+    if (pthread_rwlock_init(&cache_bucket_mutexes[i], NULL) < 0) {printf("dead.png\n");}
   }
 
   switch (CACHE_POLICY) {
